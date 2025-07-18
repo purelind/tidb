@@ -166,6 +166,28 @@ func (p *PhysicalStreamAgg) ToPB(ctx *base.BuildPBContext, storeType kv.StoreTyp
 }
 
 // ToPB implements PhysicalPlan ToPB interface.
+func (p *PhysicalSelection) ToPB(ctx *base.BuildPBContext, storeType kv.StoreType) (*tipb.Executor, error) {
+	client := ctx.GetClient()
+	conditions, err := expression.ExpressionsToPBList(ctx.GetExprCtx().GetEvalCtx(), p.Conditions, client)
+	if err != nil {
+		return nil, err
+	}
+	selExec := &tipb.Selection{
+		Conditions: conditions,
+	}
+	executorID := ""
+	if storeType == kv.TiFlash {
+		var err error
+		selExec.Child, err = p.Children()[0].ToPB(ctx, storeType)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		executorID = p.ExplainID().String()
+	}
+	return &tipb.Executor{Tp: tipb.ExecType_TypeSelection, Selection: selExec, ExecutorId: &executorID}, nil
+}
+
+// ToPB implements PhysicalPlan ToPB interface.
 func (p *PhysicalProjection) ToPB(ctx *base.BuildPBContext, storeType kv.StoreType) (*tipb.Executor, error) {
 	client := ctx.GetClient()
 	exprs, err := expression.ProjectionExpressionsToPBList(ctx.GetExprCtx().GetEvalCtx(), p.Exprs, client)
@@ -427,7 +449,7 @@ func (e *PhysicalExchangeReceiver) ToPB(ctx *base.BuildPBContext, _ kv.StoreType
 }
 
 // ToPB implements PhysicalPlan ToPB interface.
-func (p *PhysicalIndexScan) ToPB(_ *base.BuildPBContext, _ kv.StoreType) (*tipb.Executor, error) {
+func (p *PhysicalIndexScan) ToPB(_ *base.BuildPBContext, store kv.StoreType) (*tipb.Executor, error) {
 	columns := make([]*model.ColumnInfo, 0, p.Schema().Len())
 	tableColumns := p.Table.Cols()
 	for _, col := range p.Schema().Columns {
@@ -442,6 +464,31 @@ func (p *PhysicalIndexScan) ToPB(_ *base.BuildPBContext, _ kv.StoreType) (*tipb.
 	var pkColIDs []int64
 	if p.NeedCommonHandle {
 		pkColIDs = tables.TryGetCommonPkColumnIds(p.Table)
+	}
+	if store == kv.TiFlash {
+		executorID := p.ExplainID().String()
+		queryColumns := make([]*model.ColumnInfo, 0, len(p.prop.FullTextProp.QueryColumns))
+		for _, col := range p.prop.FullTextProp.QueryColumns {
+			queryColumns = append(queryColumns, FindColumnInfoByID(tableColumns, col.ID))
+		}
+		unique := false
+		idxExec := &tipb.IndexScan{
+			TableId:          p.Table.ID,
+			IndexId:          p.Index.ID,
+			Columns:          util.ColumnsToProto(columns, p.Table.PKIsHandle, true, false),
+			Desc:             false,
+			Unique:           &unique,
+			PrimaryColumnIds: pkColIDs,
+			FtsQueryInfo: &tipb.FTSQueryInfo{
+				QueryType:   tipb.FTSQueryType_FTSQueryTypeNoScore,
+				IndexId:     p.Index.ID,
+				Columns:     util.ColumnsToProto(queryColumns, p.Table.PKIsHandle, true, false),
+				ColumnNames: nil,
+				QueryText:   p.prop.FullTextProp.QueryJSONStr,
+				QueryFunc:   tipb.ScalarFuncSig_FTSMatchWord,
+			},
+		}
+		return &tipb.Executor{Tp: tipb.ExecType_TypeIndexScan, IdxScan: idxExec, ExecutorId: &executorID}, nil
 	}
 	idxExec := &tipb.IndexScan{
 		TableId:          p.Table.ID,

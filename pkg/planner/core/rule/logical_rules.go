@@ -42,7 +42,6 @@ const (
 	FlagPruneColumnsAgain
 	FlagPushDownSequence
 	FlagEliminateUnionAllDualItem
-	FlagEmptySelectionEliminator
 	FlagResolveExpand
 )
 

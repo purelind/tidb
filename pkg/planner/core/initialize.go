@@ -26,10 +26,25 @@ import (
 	"github.com/pingcap/tidb/pkg/util/size"
 )
 
+// Init initializes PhysicalSelection.
+func (p PhysicalSelection) Init(ctx base.PlanContext, stats *property.StatsInfo, qbOffset int, props ...*property.PhysicalProperty) *PhysicalSelection {
+	p.BasePhysicalPlan = physicalop.NewBasePhysicalPlan(ctx, plancodec.TypeSel, &p, qbOffset)
+	p.SetChildrenReqProps(props)
+	p.SetStats(stats)
+	return &p
+}
+
 // Init initializes PhysicalProjection.
 func (p PhysicalProjection) Init(ctx base.PlanContext, stats *property.StatsInfo, offset int, props ...*property.PhysicalProperty) *PhysicalProjection {
 	p.BasePhysicalPlan = physicalop.NewBasePhysicalPlan(ctx, plancodec.TypeProj, &p, offset)
 	p.SetChildrenReqProps(props)
+	p.SetStats(stats)
+	return &p
+}
+
+// Init initializes PhysicalTableDual.
+func (p PhysicalTableDual) Init(ctx base.PlanContext, stats *property.StatsInfo, offset int) *PhysicalTableDual {
+	p.BasePhysicalPlan = physicalop.NewBasePhysicalPlan(ctx, plancodec.TypeDual, &p, offset)
 	p.SetStats(stats)
 	return &p
 }
@@ -186,12 +201,33 @@ func (p PhysicalApply) Init(ctx base.PlanContext, stats *property.StatsInfo, off
 	return &p
 }
 
+// Init initializes PhysicalUnionScan.
+func (p PhysicalUnionScan) Init(ctx base.PlanContext, stats *property.StatsInfo, offset int, props ...*property.PhysicalProperty) *PhysicalUnionScan {
+	p.BasePhysicalPlan = physicalop.NewBasePhysicalPlan(ctx, plancodec.TypeUnionScan, &p, offset)
+	p.SetChildrenReqProps(props)
+	p.SetStats(stats)
+	return &p
+}
+
+func (p *PhysicalIndexLookUpReader) adjustReadReqType(_ base.PlanContext) {
+	if p.IndexStoreType == kv.TiFlash {
+		_, ok := p.indexPlan.(*PhysicalExchangeSender)
+		if ok {
+			p.ReadReqType = MPP
+			return
+		}
+		p.ReadReqType = BatchCop
+	}
+}
+
 // Init initializes PhysicalIndexLookUpReader.
 func (p PhysicalIndexLookUpReader) Init(ctx base.PlanContext, offset int) *PhysicalIndexLookUpReader {
 	p.BasePhysicalPlan = physicalop.NewBasePhysicalPlan(ctx, plancodec.TypeIndexLookUp, &p, offset)
 	p.TablePlans = flattenPushDownPlan(p.tablePlan)
 	p.IndexPlans = flattenPushDownPlan(p.indexPlan)
 	p.SetSchema(p.tablePlan.Schema())
+	p.IndexStoreType = p.IndexPlans[0].(*PhysicalIndexScan).StoreType
+	p.adjustReadReqType(ctx)
 	return &p
 }
 

@@ -58,11 +58,11 @@ import (
 //go:generate go run ./generator/plan_cache/plan_clone_generator.go -- plan_clone_generated.go
 
 var (
-	_ base.PhysicalPlan = &physicalop.PhysicalSelection{}
+	_ base.PhysicalPlan = &PhysicalSelection{}
 	_ base.PhysicalPlan = &PhysicalProjection{}
 	_ base.PhysicalPlan = &physicalop.PhysicalTopN{}
 	_ base.PhysicalPlan = &PhysicalMaxOneRow{}
-	_ base.PhysicalPlan = &physicalop.PhysicalTableDual{}
+	_ base.PhysicalPlan = &PhysicalTableDual{}
 	_ base.PhysicalPlan = &physicalop.PhysicalUnionAll{}
 	_ base.PhysicalPlan = &physicalop.PhysicalSort{}
 	_ base.PhysicalPlan = &physicalop.NominalSort{}
@@ -80,7 +80,7 @@ var (
 	_ base.PhysicalPlan = &PhysicalIndexJoin{}
 	_ base.PhysicalPlan = &PhysicalHashJoin{}
 	_ base.PhysicalPlan = &PhysicalMergeJoin{}
-	_ base.PhysicalPlan = &physicalop.PhysicalUnionScan{}
+	_ base.PhysicalPlan = &PhysicalUnionScan{}
 	_ base.PhysicalPlan = &PhysicalWindow{}
 	_ base.PhysicalPlan = &PhysicalShuffle{}
 	_ base.PhysicalPlan = &PhysicalShuffleReceiverStub{}
@@ -504,6 +504,13 @@ type PhysicalIndexLookUpReader struct {
 	// required by cost calculation
 	expectedCnt uint64
 	keepOrder   bool
+
+	// IndexStoreType indicates table read from which type of store.
+	IndexStoreType kv.StoreType
+
+	// ReadReqType is the read request type for current physical table reader, there are 3 kinds of read request: Cop,
+	// BatchCop and MPP, currently, the latter two are only used in TiFlash
+	ReadReqType ReadReqType
 }
 
 // Clone implements op.PhysicalPlan interface.
@@ -758,6 +765,7 @@ type PhysicalIndexScan struct {
 	isPartition bool
 	Desc        bool
 	KeepOrder   bool
+	FullText    bool
 	// ByItems only for partition table with orderBy + pushedLimit
 	ByItems []*util.ByItems
 
@@ -781,6 +789,8 @@ type PhysicalIndexScan struct {
 	// usedStatsInfo records stats status of this physical table.
 	// It's for printing stats related information when display execution plan.
 	usedStatsInfo *stmtctx.UsedStatsInfoForTable `plan-cache-clone:"shallow"`
+
+	StoreType kv.StoreType
 }
 
 // Clone implements op.PhysicalPlan interface.
@@ -2186,6 +2196,40 @@ func (p *PhysicalStreamAgg) MemoryUsage() (sum int64) {
 	return p.basePhysicalAgg.MemoryUsage()
 }
 
+// PhysicalUnionScan represents a union scan operator.
+type PhysicalUnionScan struct {
+	physicalop.BasePhysicalPlan
+
+	Conditions []expression.Expression
+
+	HandleCols util.HandleCols
+}
+
+// ExtractCorrelatedCols implements op.PhysicalPlan interface.
+func (p *PhysicalUnionScan) ExtractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := make([]*expression.CorrelatedColumn, 0)
+	for _, cond := range p.Conditions {
+		corCols = append(corCols, expression.ExtractCorColumns(cond)...)
+	}
+	return corCols
+}
+
+// MemoryUsage return the memory usage of PhysicalUnionScan
+func (p *PhysicalUnionScan) MemoryUsage() (sum int64) {
+	if p == nil {
+		return
+	}
+
+	sum = p.BasePhysicalPlan.MemoryUsage() + size.SizeOfSlice
+	if p.HandleCols != nil {
+		sum += p.HandleCols.MemoryUsage()
+	}
+	for _, cond := range p.Conditions {
+		sum += cond.MemoryUsage()
+	}
+	return
+}
+
 // IsPartition returns true and partition ID if it works on a partition.
 func (p *PhysicalIndexScan) IsPartition() (bool, int64) {
 	return p.isPartition, p.physicalTableID
@@ -2197,6 +2241,60 @@ func (p *PhysicalIndexScan) IsPointGetByUniqueKey(tc types.Context) bool {
 		p.Index.Unique &&
 		len(p.Ranges[0].LowVal) == len(p.Index.Columns) &&
 		p.Ranges[0].IsPointNonNullable(tc)
+}
+
+// PhysicalSelection represents a filter.
+type PhysicalSelection struct {
+	physicalop.BasePhysicalPlan
+
+	Conditions []expression.Expression
+
+	// The flag indicates whether this Selection is from a DataSource.
+	// The flag is only used by cost model for compatibility and will be removed later.
+	// Please see https://github.com/pingcap/tidb/issues/36243 for more details.
+	fromDataSource bool
+
+	// todo Since the feature of adding filter operators has not yet been implemented,
+	// the following code for this function will not be used for now.
+	// The flag indicates whether this Selection is used for RuntimeFilter
+	// True: Used for RuntimeFilter
+	// False: Only for normal conditions
+	// hasRFConditions bool
+}
+
+// Clone implements op.PhysicalPlan interface.
+func (p *PhysicalSelection) Clone(newCtx base.PlanContext) (base.PhysicalPlan, error) {
+	cloned := new(PhysicalSelection)
+	cloned.SetSCtx(newCtx)
+	base, err := p.BasePhysicalPlan.CloneWithSelf(newCtx, cloned)
+	if err != nil {
+		return nil, err
+	}
+	cloned.BasePhysicalPlan = *base
+	cloned.Conditions = util.CloneExprs(p.Conditions)
+	return cloned, nil
+}
+
+// ExtractCorrelatedCols implements op.PhysicalPlan interface.
+func (p *PhysicalSelection) ExtractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := make([]*expression.CorrelatedColumn, 0, len(p.Conditions))
+	for _, cond := range p.Conditions {
+		corCols = append(corCols, expression.ExtractCorColumns(cond)...)
+	}
+	return corCols
+}
+
+// MemoryUsage return the memory usage of PhysicalSelection
+func (p *PhysicalSelection) MemoryUsage() (sum int64) {
+	if p == nil {
+		return
+	}
+
+	sum = p.BasePhysicalPlan.MemoryUsage() + size.SizeOfBool
+	for _, expr := range p.Conditions {
+		sum += expr.MemoryUsage()
+	}
+	return
 }
 
 // PhysicalMaxOneRow is the physical operator of maxOneRow.
@@ -2223,6 +2321,40 @@ func (p *PhysicalMaxOneRow) MemoryUsage() (sum int64) {
 	}
 
 	return p.BasePhysicalPlan.MemoryUsage()
+}
+
+// PhysicalTableDual is the physical operator of dual.
+type PhysicalTableDual struct {
+	physicalop.PhysicalSchemaProducer
+
+	RowCount int
+
+	// names is used for OutputNames() method. Dual may be inited when building point get plan.
+	// So it needs to hold names for itself.
+	names []*types.FieldName
+}
+
+// OutputNames returns the outputting names of each column.
+func (p *PhysicalTableDual) OutputNames() types.NameSlice {
+	return p.names
+}
+
+// SetOutputNames sets the outputting name by the given slice.
+func (p *PhysicalTableDual) SetOutputNames(names types.NameSlice) {
+	p.names = names
+}
+
+// MemoryUsage return the memory usage of PhysicalTableDual
+func (p *PhysicalTableDual) MemoryUsage() (sum int64) {
+	if p == nil {
+		return
+	}
+
+	sum = p.PhysicalSchemaProducer.MemoryUsage() + size.SizeOfInt + size.SizeOfSlice + int64(cap(p.names))*size.SizeOfPointer
+	for _, name := range p.names {
+		sum += name.MemoryUsage()
+	}
+	return
 }
 
 // PhysicalWindow is the physical operator of window function.

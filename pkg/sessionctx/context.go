@@ -122,7 +122,6 @@ type Context interface {
 	GetSchemaValidator() validatorapi.Validator
 	// GetSQLServer returns the sqlsvrapi.Server.
 	GetSQLServer() sqlsvrapi.Server
-	IsCrossKS() bool
 
 	GetSessionVars() *variable.SessionVars
 
